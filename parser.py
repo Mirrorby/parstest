@@ -561,6 +561,9 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
         return
     log.info(f'[{label}] connected, channels: {len(channels)}')
 
+    channels = channels.copy()
+    random.shuffle(channels)
+
     processed = 0
     cache_dirty = False
 
