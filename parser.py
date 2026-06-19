@@ -64,7 +64,7 @@ from telethon.sessions import StringSession
 GS_B64         = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '').strip()
 MSG_LIMIT      = int(os.environ.get('MESSAGES_LIMIT', '10'))
-MAX_BACKLOG    = int(os.environ.get('MAX_BACKLOG', '200'))
+MAX_BACKLOG    = int(os.environ.get('MAX_BACKLOG', '100'))
 
 DELAY_MIN = 1.5   # минимальная пауза между каналами (сек)
 DELAY_MAX = 3.0   # максимальная пауза (джиттер)
@@ -569,6 +569,10 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
                 [m for m in new_msgs if m.action is None],
                 key=lambda m: m.id,
             )
+            if not new_msgs:
+                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                processed += 1
+                continue
 
             media_skipped = 0
           
@@ -616,7 +620,8 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
             if media_skipped:
                 log.info(f'[{label}] [{uname}] media skipped: {media_skipped}')
 
-            state[uname] = new_msgs[-1].id
+            if new_msgs:
+                state[uname] = new_msgs[-1].id
             processed += 1
 
             # ── периодическое сохранение state ────────────────────────────
