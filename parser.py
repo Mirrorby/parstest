@@ -64,6 +64,7 @@ from telethon.sessions import StringSession
 GS_B64         = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 SPREADSHEET_ID = os.environ.get('SPREADSHEET_ID', '').strip()
 MSG_LIMIT      = int(os.environ.get('MESSAGES_LIMIT', '10'))
+MAX_BACKLOG    = int(os.environ.get('MAX_BACKLOG', '200'))
 
 DELAY_MIN = 1.5   # минимальная пауза между каналами (сек)
 DELAY_MAX = 3.0   # максимальная пауза (джиттер)
@@ -536,31 +537,41 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
 
             known_last = state.get(uname, 0)
 
-            messages = await _tg_call(client.get_messages, uname,
-                                      limit=MSG_LIMIT, label=label)
-            if not messages:
-                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-                continue
-
-            # ── первый запуск — запомнить last_id, ничего не слать ─────────
             if known_last == 0:
+                # первый запуск — просто запоминаем last_id текущего верхнего поста, ничего не шлём
+                messages = await _tg_call(client.get_messages, uname,
+                                          limit=MSG_LIMIT, label=label)
+                if not messages:
+                    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                    continue
                 state[uname] = messages[0].id
                 log.info(f'[{label}] [{uname}] first run, last_id={messages[0].id}')
                 await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
                 processed += 1
                 continue
 
-            new_msgs = sorted(
-                [m for m in messages if m.id > known_last and m.action is None],
-                key=lambda m: m.id,
-            )
+            # ── забираем ВСЮ разницу от known_last до текущего верха, не только MSG_LIMIT штук ──
+            new_msgs = await _tg_call(client.get_messages, uname,
+                                      min_id=known_last, limit=MAX_BACKLOG, label=label)
+            if new_msgs is None:
+                await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                continue
             if not new_msgs:
                 await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
                 processed += 1
                 continue
 
-            media_skipped = 0
+            if len(new_msgs) >= MAX_BACKLOG:
+                log.warning(f'[{label}] [{uname}] backlog >= {MAX_BACKLOG}, часть постов будет '
+                            f'добрана на следующих прогонах')
 
+            new_msgs = sorted(
+                [m for m in new_msgs if m.action is None],
+                key=lambda m: m.id,
+            )
+
+            media_skipped = 0
+          
             for m in new_msgs:
                 # ── медиаконтент (фото/документы/альбомы) — сразу пропускаем ──
                 if _has_media(m):
