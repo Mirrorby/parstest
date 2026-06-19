@@ -26,6 +26,8 @@ GitHub Secrets (минимум):
   Состояние: A=username B=last_id
 
 Фильтрация постов (без AI, по модели monitor_tg_2/utils.py):
+  0. Медиаконтент: посты с фото/документами/альбомами пропускаются сразу,
+     без скачивания и без отправки (с вероятностью 99,9% не подходят).
   1. Минус-слова: если найдено хотя бы одно — пост отбрасывается.
      Короткие слова (<=4 символа) ищутся по границе кириллица/латиница,
      длинные — простым substring-поиском.
@@ -39,7 +41,6 @@ GitHub Secrets (минимум):
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
@@ -417,6 +418,11 @@ def _get_sender(m):
     return author, account
 
 
+def _has_media(m):
+    """Пост содержит фото/документ/альбом — такие посты пропускаем целиком."""
+    return bool(m.photo or m.document or getattr(m, 'grouped_id', None))
+
+
 # ── telegram send (bot API) ──────────────────────────────────────────────────────
 
 def _bot_request(req, timeout, label):
@@ -451,66 +457,6 @@ def _tg_text(token, chats, text):
             time.sleep(0.3)
         except Exception as e:
             log.error(f'tg_text {chat}: {e}')
-
-
-def _tg_photo(token, chats, caption, photo: bytes):
-    for chat in chats:
-        try:
-            boundary = 'B' + str(int(time.time()))
-            parts = [
-                f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat}'.encode(),
-                f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption[:1024]}'.encode(),
-                (f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; '
-                 f'filename="p.jpg"\r\nContent-Type: image/jpeg\r\n\r\n').encode() + photo,
-                f'--{boundary}--'.encode(),
-            ]
-            body = b'\r\n'.join(parts)
-            req = urllib.request.Request(
-                f'https://api.telegram.org/bot{token}/sendPhoto', data=body,
-                headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
-            if not _bot_request(req, timeout=30, label=f'tg_photo {chat}'):
-                _tg_text(token, [chat], caption)
-            time.sleep(0.3)
-        except Exception as e:
-            log.error(f'tg_photo {chat}: {e}')
-            _tg_text(token, [chat], caption)
-
-
-def _tg_album(token, chats, caption, photos: list):
-    if not photos:
-        _tg_text(token, chats, caption)
-        return
-    photos = photos[:10]
-    for chat in chats:
-        try:
-            media = []
-            for i in range(len(photos)):
-                item = {'type': 'photo', 'media': f'attach://p{i}'}
-                if i == 0:
-                    item['caption'] = caption[:1024]
-                media.append(item)
-            boundary = 'B' + str(int(time.time()))
-            parts = [
-                f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat}'.encode(),
-                (f'--{boundary}\r\nContent-Disposition: form-data; name="media"\r\n'
-                 f'Content-Type: application/json\r\n\r\n{json.dumps(media)}').encode(),
-            ]
-            for i, pb in enumerate(photos):
-                parts.append(
-                    (f'--{boundary}\r\nContent-Disposition: form-data; name="p{i}"; '
-                     f'filename="p{i}.jpg"\r\nContent-Type: image/jpeg\r\n\r\n').encode() + pb
-                )
-            parts.append(f'--{boundary}--'.encode())
-            body = b'\r\n'.join(parts)
-            req = urllib.request.Request(
-                f'https://api.telegram.org/bot{token}/sendMediaGroup', data=body,
-                headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
-            if not _bot_request(req, timeout=30, label=f'tg_album {chat}'):
-                _tg_text(token, [chat], caption)
-            time.sleep(0.3)
-        except Exception as e:
-            log.error(f'tg_album {chat}: {e}')
-            _tg_text(token, [chat], caption)
 
 
 # ── safe TG call ───────────────────────────────────────────────────────────────
@@ -613,23 +559,15 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
                 processed += 1
                 continue
 
-            groups: dict[int, list] = {}
-            singles = []
+            media_skipped = 0
+
             for m in new_msgs:
-                gid = getattr(m, 'grouped_id', None)
-                if gid:
-                    groups.setdefault(gid, []).append(m)
-                else:
-                    singles.append(m)
+                # ── медиаконтент (фото/документы/альбомы) — сразу пропускаем ──
+                if _has_media(m):
+                    media_skipped += 1
+                    continue
 
-            token = cfg['token']
-            dest  = cfg['chats']
-
-            # ── одиночные сообщения ────────────────────────────────────────
-            for m in singles:
                 text = m.text or m.message or ''
-                if hasattr(m, 'caption') and m.caption:
-                    text = m.caption
                 text = ' '.join(text.split())
 
                 if not text.strip():
@@ -652,25 +590,11 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
                 body = (f'📢 {uname}\n{author_line}\n\n{text}\n\n🔗 {link}'
                         if author_line else f'📢 {uname}\n\n{text}\n\n🔗 {link}')
 
-                photos = []
-                if m.photo:
-                    try:
-                        buf = io.BytesIO()
-                        await asyncio.wait_for(
-                            client.download_media(m, file=buf), timeout=30)
-                        photos = [buf.getvalue()]
-                    except asyncio.TimeoutError:
-                        log.warning(f'[{label}] download_media timeout {uname}/{m.id}')
-                    except Exception:
-                        pass
-
+                token = cfg['token']
+                dest  = cfg['chats']
                 if token and dest:
-                    if photos:
-                        await loop.run_in_executor(
-                            pool, _tg_photo, token, dest, body, photos[0])
-                    else:
-                        await loop.run_in_executor(
-                            pool, _tg_text, token, dest, body)
+                    await loop.run_in_executor(
+                        pool, _tg_text, token, dest, body)
 
                 await loop.run_in_executor(
                     pool, _gs_write_post, ss,
@@ -678,66 +602,8 @@ async def run(channels: list, ss, cfg, state, cache, dedup, minus_words, scoring
                 dedup.add(norm)
                 log.info(f'[{label}] sent {uname} {link} score={score}')
 
-            # ── альбомы ───────────────────────────────────────────────────
-            for gid, msgs in groups.items():
-                msgs = sorted(msgs, key=lambda m: m.id)
-                text = ''
-                for m in msgs:
-                    t = m.text or m.message or ''
-                    if hasattr(m, 'caption') and m.caption:
-                        t = m.caption
-                    t = ' '.join(t.split())
-                    if t:
-                        text = t
-                        break
-
-                if not text.strip():
-                    continue
-                norm = ' '.join(text.lower().split())
-                if norm in dedup:
-                    continue
-
-                passed, score = _passes_filters(
-                    text, minus_words, scoring_rules,
-                    cfg['min_len'], cfg['score_threshold'],
-                    label_for_log=f'[{label}] [{uname}] album')
-                if not passed:
-                    dedup.add(norm)
-                    continue
-
-                link = _make_link(uname, msgs[0].id)
-                author, account = _get_sender(msgs[0])
-                author_line = f'👤 {author}  {account}'.strip() if author or account else ''
-                body = (f'📢 {uname}\n{author_line}\n\n{text}\n\n🔗 {link}'
-                        if author_line else f'📢 {uname}\n\n{text}\n\n🔗 {link}')
-
-                photos = []
-                for m in msgs:
-                    if m.photo or m.document:
-                        try:
-                            buf = io.BytesIO()
-                            await asyncio.wait_for(
-                                client.download_media(m, file=buf), timeout=30)
-                            photos.append(buf.getvalue())
-                        except asyncio.TimeoutError:
-                            log.warning(f'[{label}] download_media timeout {uname}/{m.id}')
-                        except Exception:
-                            pass
-
-                if token and dest:
-                    if photos:
-                        await loop.run_in_executor(
-                            pool, _tg_album, token, dest, body, photos)
-                    else:
-                        await loop.run_in_executor(
-                            pool, _tg_text, token, dest, body)
-
-                post_text = text + (f' [photo:{len(photos)}]' if photos else '')
-                await loop.run_in_executor(
-                    pool, _gs_write_post, ss,
-                    msgs[0].date.replace(tzinfo=None), uname, author, account, link, post_text, score)
-                dedup.add(norm)
-                log.info(f'[{label}] sent {uname} album({len(photos)}) {link} score={score}')
+            if media_skipped:
+                log.info(f'[{label}] [{uname}] media skipped: {media_skipped}')
 
             state[uname] = new_msgs[-1].id
             processed += 1
